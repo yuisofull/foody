@@ -1,6 +1,14 @@
 from __future__ import annotations
 
+from enum import Enum
+
 from pydantic import BaseModel, Field
+
+
+class NutritionConfidence(str, Enum):
+    high = "high"
+    medium = "medium"
+    low = "low"
 
 
 class MenuItem(BaseModel):
@@ -13,3 +21,22 @@ class MenuItem(BaseModel):
         default_factory=list,
         description="Dietary/attribute tags (e.g., vegan, gluten-free, spicy)",
     )
+
+    estimated_calories_kcal: int | None = Field(
+        None,
+        ge=0,
+        description="Estimated calories in kcal",
+    )
+    estimated_protein_g: float | None = Field(
+        None,
+        ge=0,
+        description="Estimated protein in grams",
+    )
+    nutrition_confidence: NutritionConfidence | None = Field(
+        None,
+        description="Confidence level of the nutrition estimate",
+    )
+    nutrition_notes: str | None = Field(
+        None,
+        description="Short note explaining the basis of the nutrition estimate",
+    )   
