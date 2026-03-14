@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import httpx
 
 from app.cache.restaurant_cache import RestaurantCache
@@ -18,6 +19,13 @@ class RestaurantService:
     PLACES_NEARBY_URL = (
         "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
     )
+    PLACES_NEARBY_NEW_URL = "https://places.googleapis.com/v1/places:searchNearby"
+    PLACES_FIELD_MASK = (
+        "places.id,places.displayName,places.formattedAddress,places.location,"
+        "places.types,places.rating,places.internationalPhoneNumber,places.websiteUri"
+    )
+
+    _logger = logging.getLogger(__name__)
 
     def __init__(self, cache: RestaurantCache | None = None) -> None:
         settings = get_settings()
@@ -58,6 +66,72 @@ class RestaurantService:
         if not self._api_key:
             return []
 
+        # Prefer Places API (New). Fall back to legacy API if unavailable.
+        new_api_results = await self._fetch_from_google_new(location, radius)
+        if new_api_results is not None:
+            return new_api_results
+
+        return await self._fetch_from_google_legacy(location, radius)
+
+    async def _fetch_from_google_new(
+        self,
+        location: Location,
+        radius: float,
+    ) -> list[Restaurant] | None:
+        headers = {
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": self._api_key,
+            "X-Goog-FieldMask": self.PLACES_FIELD_MASK,
+        }
+        payload = {
+            "includedTypes": ["restaurant"],
+            "maxResultCount": 20,
+            "locationRestriction": {
+                "circle": {
+                    "center": {
+                        "latitude": location.lat,
+                        "longitude": location.lng,
+                    },
+                    "radius": float(radius),
+                }
+            },
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.post(
+                    self.PLACES_NEARBY_NEW_URL,
+                    headers=headers,
+                    json=payload,
+                )
+                response.raise_for_status()
+                data = response.json()
+        except (httpx.HTTPError, ValueError):
+            self._logger.warning("Places API (New) request failed", exc_info=True)
+            return None
+
+        places = data.get("places")
+        if places is None:
+            error_message = data.get("error", {}).get("message") if isinstance(data, dict) else None
+            self._logger.warning(
+                "Places API (New) unavailable or denied; falling back to legacy API. error=%s",
+                error_message,
+            )
+            return None
+
+        restaurants: list[Restaurant] = []
+        for place in places:
+            restaurant = self._parse_place_new(place)
+            if restaurant:
+                restaurants.append(restaurant)
+        return restaurants
+
+    async def _fetch_from_google_legacy(
+        self,
+        location: Location,
+        radius: float,
+    ) -> list[Restaurant]:
+
         params = {
             "location": f"{location.lat},{location.lng}",
             "radius": str(int(radius)),
@@ -78,6 +152,15 @@ class RestaurantService:
                 except (httpx.HTTPError, ValueError):
                     break
 
+                status = data.get("status")
+                if status not in {"OK", "ZERO_RESULTS"}:
+                    self._logger.warning(
+                        "Legacy Places API denied or failed. status=%s, message=%s",
+                        status,
+                        data.get("error_message"),
+                    )
+                    break
+
                 for place in data.get("results", []):
                     restaurant = self._parse_place(place)
                     if restaurant:
@@ -88,6 +171,29 @@ class RestaurantService:
                     break
 
         return restaurants
+
+    def _parse_place_new(self, place: dict) -> Restaurant | None:
+        place_id = place.get("id")
+        name = place.get("displayName", {}).get("text")
+        if not place_id or not name:
+            return None
+
+        location = place.get("location", {})
+        lat = location.get("latitude")
+        lng = location.get("longitude")
+        if lat is None or lng is None:
+            return None
+
+        return Restaurant(
+            id=place_id,
+            name=name,
+            address=place.get("formattedAddress", ""),
+            location=Location(lat=lat, lng=lng),
+            cuisine_types=place.get("types", []),
+            rating=place.get("rating"),
+            phone=place.get("internationalPhoneNumber"),
+            website=place.get("websiteUri"),
+        )
 
     def _parse_place(self, place: dict) -> Restaurant | None:
         place_id = place.get("place_id")
