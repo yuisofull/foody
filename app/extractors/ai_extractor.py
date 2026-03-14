@@ -4,7 +4,6 @@ import json
 import uuid
 
 import httpx
-from openai import AsyncOpenAI
 
 from app.config import get_settings
 from app.extractors.base import MenuExtractor
@@ -40,8 +39,8 @@ class AIMenuExtractor(MenuExtractor):
 
     def __init__(self) -> None:
         settings = get_settings()
-        self._client = AsyncOpenAI(api_key=settings.openai_api_key)
-        self._model = settings.openai_model
+        self._api_key = settings.gemini_api_key
+        self._model = settings.gemini_model
 
     @property
     def name(self) -> str:
@@ -74,17 +73,36 @@ class AIMenuExtractor(MenuExtractor):
         return None
 
     async def _extract_with_llm(self, content: str) -> list[MenuItem]:
+        if not self._api_key:
+            return []
+
+        request_payload = {
+            "system_instruction": {
+                "parts": [{"text": _SYSTEM_PROMPT}],
+            },
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": content}],
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0,
+                "responseMimeType": "application/json",
+            },
+        }
+
         try:
-            response = await self._client.chat.completions.create(
-                model=self._model,
-                messages=[
-                    {"role": "system", "content": _SYSTEM_PROMPT},
-                    {"role": "user", "content": content},
-                ],
-                temperature=0,
-                response_format={"type": "json_object"},
-            )
-            raw = response.choices[0].message.content or ""
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                response = await client.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{self._model}:generateContent",
+                    params={"key": self._api_key},
+                    json=request_payload,
+                )
+                response.raise_for_status()
+                data = response.json()
+
+            raw = _extract_gemini_text(data)
             return self._parse_response(raw)
         except Exception:
             return []
@@ -114,12 +132,47 @@ class AIMenuExtractor(MenuExtractor):
                     MenuItem(
                         id=str(uuid.uuid4()),
                         name=str(entry["name"]),
-                        price=float(entry["price"]) if entry.get("price") is not None else None,
-                        description=str(entry["description"]) if entry.get("description") else None,
-                        category=str(entry["category"]) if entry.get("category") else None,
+                        price=(
+                            float(entry["price"])
+                            if entry.get("price") is not None
+                            else None
+                        ),
+                        description=(
+                            str(entry["description"])
+                            if entry.get("description")
+                            else None
+                        ),
+                        category=(
+                            str(entry["category"]) if entry.get("category") else None
+                        ),
                         tags=[str(t) for t in entry.get("tags", []) if t],
                     )
                 )
             return items
         except (json.JSONDecodeError, ValueError, TypeError):
             return []
+
+
+def _extract_gemini_text(payload: dict) -> str:
+    candidates = payload.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        return ""
+
+    first = candidates[0]
+    content = first.get("content", {}) if isinstance(first, dict) else {}
+    parts = content.get("parts", []) if isinstance(content, dict) else []
+    if not isinstance(parts, list):
+        return ""
+
+    chunks: list[str] = []
+    for part in parts:
+        if isinstance(part, dict):
+            text = part.get("text")
+            if isinstance(text, str):
+                chunks.append(text)
+
+    raw = "\n".join(chunks).strip()
+    if raw.startswith("```"):
+        lines = [line for line in raw.splitlines() if not line.startswith("```")]
+        return "\n".join(lines).strip()
+    return raw

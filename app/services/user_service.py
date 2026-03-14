@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
+from app.cache.user_profile_cache import UserProfileCache
 from app.config import get_settings
 from app.models.user import GoalType, MacroSplits, UserProfile
 
@@ -36,6 +36,10 @@ class UserService:
     def __init__(self, storage_path: str | None = None) -> None:
         settings = get_settings()
         self._storage_path = Path(storage_path or settings.user_profile_storage_path)
+        self._profile_cache = UserProfileCache(
+            maxsize=settings.user_profile_cache_maxsize,
+            ttl=settings.user_profile_cache_ttl,
+        )
 
     def analyze_user_preference_profile(self, profile: UserProfile) -> UserProfile:
         """
@@ -51,7 +55,9 @@ class UserService:
         Returns:
             A UserProfile with goal-appropriate defaults applied.
         """
-        defaults = _GOAL_DEFAULTS.get(profile.goal_type, _GOAL_DEFAULTS[GoalType.general_health])
+        defaults = _GOAL_DEFAULTS.get(
+            profile.goal_type, _GOAL_DEFAULTS[GoalType.general_health]
+        )
 
         # Only apply defaults when the user has not customised the values
         cal_target = profile.cal_target
@@ -89,6 +95,7 @@ class UserService:
             json.dumps(profiles, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+        self._profile_cache.set(profile.user_id, profile)
 
     def get_user_profile(self, user_id: str) -> UserProfile | None:
         """
@@ -96,13 +103,19 @@ class UserService:
 
         Returns None if not found.
         """
+        cached = self._profile_cache.get(user_id)
+        if cached is not None:
+            return cached
+
         if not self._storage_path.exists():
             return None
         try:
             profiles = json.loads(self._storage_path.read_text(encoding="utf-8"))
             data = profiles.get(user_id)
             if data:
-                return UserProfile.model_validate(data)
+                profile = UserProfile.model_validate(data)
+                self._profile_cache.set(user_id, profile)
+                return profile
         except (json.JSONDecodeError, OSError, ValueError):
             pass
         return None
@@ -124,6 +137,14 @@ class UserService:
                 json.dumps(profiles, indent=2, ensure_ascii=False),
                 encoding="utf-8",
             )
+            self._profile_cache.invalidate(user_id)
             return True
         except (json.JSONDecodeError, OSError):
             return False
+
+    def invalidate_profile_cache(self, user_id: str) -> None:
+        self._profile_cache.invalidate(user_id)
+
+    @property
+    def cache_stats(self) -> dict[str, int]:
+        return self._profile_cache.stats
