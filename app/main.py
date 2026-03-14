@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from app.cache.menu_cache import MenuExtractionCache
+from app.cache.menu_nutrition_cache import MenuNutritionCache
+from app.cache.recommendation_cache import RecommendationCache
 from app.cache.restaurant_cache import RestaurantCache
 from app.config import get_settings
 from app.extractors.ai_extractor import AIMenuExtractor
@@ -39,6 +43,18 @@ _cache = RestaurantCache(
     maxsize=_settings.restaurant_cache_maxsize,
     ttl=_settings.restaurant_cache_ttl,
 )
+_menu_cache = MenuExtractionCache(
+    maxsize=_settings.menu_cache_maxsize,
+    ttl=_settings.menu_cache_ttl,
+)
+_menu_nutrition_cache = MenuNutritionCache(
+    maxsize=_settings.menu_nutrition_cache_maxsize,
+    ttl=_settings.menu_nutrition_cache_ttl,
+)
+_recommendation_cache = RecommendationCache(
+    maxsize=_settings.recommendation_cache_maxsize,
+    ttl=_settings.recommendation_cache_ttl,
+)
 _restaurant_service = RestaurantService(cache=_cache)
 _default_providers = [
     MenulogProvider(),
@@ -50,7 +66,11 @@ _default_extractors = [
     AIMenuExtractor(),
     OCRExtractor(),
 ]
-_menu_service = MenuService(providers=_default_providers, extractors=_default_extractors)
+_menu_service = MenuService(
+    providers=_default_providers,
+    extractors=_default_extractors,
+    menu_cache=_menu_cache,
+)
 _nutrition_service = NutritionService()
 _user_service = UserService()
 _ranking_service = RankingService()
@@ -66,52 +86,77 @@ class NearbyRequest(BaseModel):
     radius: float = Field(1000.0, gt=0, le=50000, description="Search radius in metres")
 
 
-class ExtractMenuRequest(BaseModel):
-    menu_url: str = Field(..., description="URL of the menu page")
-
-
-class NutritionRequest(BaseModel):
-    item: MenuItem
-    estimator: Estimator = Estimator.ai
-
-
 class DiscoverRequest(BaseModel):
     location: Location
     radius: float = Field(1000.0, gt=0, le=50000, description="Search radius in metres")
+    profile: UserProfile | None = Field(
+        None,
+        description="Optional user profile used for ranking recommendations per restaurant",
+    )
+    top_n: int = Field(
+        3, ge=1, le=20, description="Top N recommendations per restaurant"
+    )
+    preferences: dict[str, str] | None = Field(
+        None,
+        description="Optional product-level preferences for future discover tuning",
+    )
 
 
-class DiscoveredItem(BaseModel):
-    item: MenuItem
-    nutrition: NutritionEstimate
+class RestaurantMenuResponse(BaseModel):
+    restaurant_id: str
+    items: list[MenuItem] = Field(default_factory=list)
 
 
-class RankingRequest(BaseModel):
-    profile: UserProfile
+class NutritionBatchRequest(BaseModel):
     items: list[MenuItem] = Field(
         default_factory=list,
-        description="Menu items to rank. When empty, provide location and radius to discover items.",
+        min_length=1,
+        description="Menu items to estimate nutrition for",
     )
-    n: int = Field(10, ge=1, le=100, description="Number of top items to return")
-    nutrition_map: dict[str, NutritionEstimate] | None = Field(
-        None,
-        description="Optional pre-computed nutrition keyed by item ID",
-    )
-    location: Location | None = Field(
-        None,
-        description="User location for on-the-fly item discovery when items list is empty",
-    )
-    radius: float = Field(
-        1000.0,
-        gt=0,
-        le=50000,
-        description="Search radius in metres (used with location for discovery)",
-    )
+    estimator: Estimator = Estimator.ai
 
 
-class RankedItemResponse(BaseModel):
-    item: MenuItem
+class NutritionItemResponse(BaseModel):
+    id: str
+    calories: float | None
+    protein: float | None
+    carbs: float | None
+    fat: float | None
+    confidence: str
+
+
+class NutritionBatchResponse(BaseModel):
+    items: list[NutritionItemResponse]
+
+
+class UpsertUserProfileRequest(UserProfile):
+    pass
+
+
+class RecommendationRequest(BaseModel):
+    user_id: str
+    restaurant_id: str
+    top_n: int = Field(5, ge=1, le=100)
+
+
+class RecommendationItemResponse(BaseModel):
+    name: str
     score: float
     nutrition: NutritionEstimate | None
+
+
+class RecommendationResponse(BaseModel):
+    restaurant_id: str
+    recommendations: list[RecommendationItemResponse]
+
+
+class DiscoverRestaurantResult(BaseModel):
+    restaurant: Restaurant
+    recommendations: list[RecommendationItemResponse]
+
+
+class DiscoverResponse(BaseModel):
+    results: list[DiscoverRestaurantResult]
 
 
 # ---------------------------------------------------------------------------
@@ -130,32 +175,51 @@ async def get_nearby_restaurants(body: NearbyRequest) -> list[Restaurant]:
     return await _restaurant_service.get_nearby_restaurants(body.location, body.radius)
 
 
-@app.post("/menu/extract", response_model=list[MenuItem])
-async def extract_menu(body: ExtractMenuRequest) -> list[MenuItem]:
-    """ExtractMenu(MenuURL) -> items"""
-    return await _menu_service.extract_menu(body.menu_url)
+@app.get("/restaurants/{restaurant_id}/menu", response_model=RestaurantMenuResponse)
+async def get_restaurant_menu(restaurant_id: str) -> RestaurantMenuResponse:
+    """Lookup a restaurant by ID and return extracted menu items."""
+    restaurant = await _get_restaurant_by_id(restaurant_id)
+    if restaurant is None:
+        raise HTTPException(status_code=404, detail="Restaurant not found")
+
+    items = await _menu_service.get_menu_items(restaurant)
+    return RestaurantMenuResponse(restaurant_id=restaurant_id, items=items)
 
 
-@app.post("/menu/discover", response_model=list[DiscoveredItem])
-async def discover_menu(body: DiscoverRequest) -> list[DiscoveredItem]:
-    """
-    Full discovery pipeline: location -> nearby restaurants -> menu items -> nutrition estimates.
+@app.post("/menu/nutrition", response_model=NutritionBatchResponse)
+async def estimate_menu_nutrition(
+    body: NutritionBatchRequest,
+) -> NutritionBatchResponse:
+    """Estimate nutrition for a list of menu items."""
+    results: list[NutritionItemResponse] = []
+    for item in body.items:
+        estimate = await _nutrition_service.estimate_nutrition(
+            item, estimator=body.estimator
+        )
+        results.append(
+            NutritionItemResponse(
+                id=item.id,
+                calories=estimate.calories,
+                protein=estimate.protein,
+                carbs=estimate.carbs,
+                fat=estimate.fat,
+                confidence=estimate.confidence.value,
+            )
+        )
+    return NutritionBatchResponse(items=results)
 
-    For each nearby restaurant, resolves menu URLs, extracts items, and estimates
-    nutrition.  Returns all discovered items with their nutrition data and notifies
-    the caller that discovery is complete via the response.
-    """
-    restaurants = await _restaurant_service.get_nearby_restaurants(body.location, body.radius)
-    return await _discover_items_for_restaurants(restaurants)
+
+@app.post("/users/profile", response_model=UserProfile)
+async def upsert_user_profile(profile: UpsertUserProfileRequest) -> UserProfile:
+    """StoreUserProfile + AnalyzeUserPreferenceProfile"""
+    enriched = _user_service.analyze_user_preference_profile(profile)
+    _user_service.store_user_profile(enriched)
+    _recommendation_cache.invalidate_user(enriched.user_id)
+    _user_service.invalidate_profile_cache(enriched.user_id)
+    return enriched
 
 
-@app.post("/nutrition/estimate", response_model=NutritionEstimate)
-async def estimate_nutrition(body: NutritionRequest) -> NutritionEstimate:
-    """EstimateNutrition(item, Estimator) -> NutritionEstimate"""
-    return await _nutrition_service.estimate_nutrition(body.item, body.estimator)
-
-
-@app.get("/user/{user_id}/profile", response_model=UserProfile)
+@app.get("/users/{user_id}", response_model=UserProfile)
 async def get_user_profile(user_id: str) -> UserProfile:
     profile = _user_service.get_user_profile(user_id)
     if profile is None:
@@ -163,65 +227,233 @@ async def get_user_profile(user_id: str) -> UserProfile:
     return profile
 
 
-@app.put("/user/{user_id}/profile", response_model=UserProfile)
-async def upsert_user_profile(user_id: str, profile: UserProfile) -> UserProfile:
-    """StoreUserProfile + AnalyzeUserPreferenceProfile"""
-    if profile.user_id != user_id:
-        raise HTTPException(
-            status_code=400,
-            detail="user_id in path must match user_id in body",
-        )
-    enriched = _user_service.analyze_user_preference_profile(profile)
-    _user_service.store_user_profile(enriched)
-    return enriched
-
-
-@app.delete("/user/{user_id}/profile")
-async def delete_user_profile(user_id: str) -> dict[str, str]:
-    deleted = _user_service.delete_user_profile(user_id)
-    if not deleted:
+@app.post("/recommendations", response_model=RecommendationResponse)
+async def recommend_menu(body: RecommendationRequest) -> RecommendationResponse:
+    """
+    Orchestrate all services: profile -> menu extraction -> nutrition -> ranking.
+    """
+    profile = _user_service.get_user_profile(body.user_id)
+    if profile is None:
         raise HTTPException(status_code=404, detail="User profile not found")
-    return {"status": "deleted"}
 
+    restaurant = await _get_restaurant_by_id(body.restaurant_id)
+    if restaurant is None:
+        raise HTTPException(status_code=404, detail="Restaurant not found")
 
-@app.post("/menu/rank", response_model=list[RankedItemResponse])
-async def rank_menu(body: RankingRequest) -> list[RankedItemResponse]:
-    """
-    RankingTopMenu(user_profile, []items, N) -> top N items
+    cached_recommendations = _recommendation_cache.get(body.user_id, body.restaurant_id)
+    if cached_recommendations is not None and len(cached_recommendations) >= body.top_n:
+        return RecommendationResponse(
+            restaurant_id=body.restaurant_id,
+            recommendations=[
+                RecommendationItemResponse(name=name, score=score, nutrition=nutrition)
+                for name, score, nutrition in cached_recommendations[: body.top_n]
+            ],
+        )
 
-    Items can be supplied directly in the request body.  When the items list is
-    empty and a location is provided, the full discovery pipeline is run first
-    (nearby restaurants -> menu items -> nutrition) and those items are ranked.
-    """
-    items = list(body.items)
-    nutrition_map: dict[str, NutritionEstimate] = dict(body.nutrition_map or {})
-
-    if not items and body.location is not None:
-        # Run discovery pipeline to obtain items and build nutrition map
-        restaurants = await _restaurant_service.get_nearby_restaurants(body.location, body.radius)
-        discovered = await _discover_items_for_restaurants(restaurants)
-        for discovered_item in discovered:
-            nutrition_map[discovered_item.item.id] = discovered_item.nutrition
-            items.append(discovered_item.item)
-
+    items = await _menu_service.get_menu_items(restaurant)
+    nutrition_map = await _build_nutrition_map(body.restaurant_id, items)
     ranked = _ranking_service.rank_top_menu(
-        profile=body.profile,
+        profile=profile,
         items=items,
-        n=body.n,
+        n=body.top_n,
         nutrition_map=nutrition_map,
     )
-    return [
-        RankedItemResponse(item=r.item, score=r.score, nutrition=r.nutrition)
-        for r in ranked
+    recommendations = [
+        RecommendationItemResponse(
+            name=ranked_item.item.name,
+            score=ranked_item.score,
+            nutrition=ranked_item.nutrition,
+        )
+        for ranked_item in ranked
     ]
+    _recommendation_cache.set(
+        body.user_id,
+        body.restaurant_id,
+        [(item.name, item.score, item.nutrition) for item in recommendations],
+    )
+
+    return RecommendationResponse(
+        restaurant_id=body.restaurant_id,
+        recommendations=recommendations,
+    )
 
 
-async def _discover_items_for_restaurants(restaurants: list[Restaurant]) -> list[DiscoveredItem]:
-    """Run the menu extraction + nutrition estimation pipeline for a list of restaurants."""
-    result: list[DiscoveredItem] = []
+@app.post("/discover", response_model=DiscoverResponse)
+async def discover(body: DiscoverRequest) -> DiscoverResponse:
+    """
+    Smart discovery endpoint:
+    location + profile/preferences -> restaurants + recommended dishes.
+    """
+    restaurants = await _restaurant_service.get_nearby_restaurants(
+        body.location, body.radius
+    )
+    profile = body.profile
+    if not profile:
+        return DiscoverResponse(results=[])  # No profile = no recommendations for now
+
+    results: list[DiscoverRestaurantResult] = []
     for restaurant in restaurants:
+        cached_recommendations = _recommendation_cache.get(
+            profile.user_id, restaurant.id
+        )
+        if (
+            cached_recommendations is not None
+            and len(cached_recommendations) >= body.top_n
+        ):
+            results.append(
+                DiscoverRestaurantResult(
+                    restaurant=restaurant,
+                    recommendations=[
+                        RecommendationItemResponse(
+                            name=name, score=score, nutrition=nutrition
+                        )
+                        for name, score, nutrition in cached_recommendations[
+                            : body.top_n
+                        ]
+                    ],
+                )
+            )
+            continue
+
         items = await _menu_service.get_menu_items(restaurant)
-        for item in items:
-            nutrition = await _nutrition_service.estimate_nutrition(item)
-            result.append(DiscoveredItem(item=item, nutrition=nutrition))
-    return result
+        nutrition_map = await _build_nutrition_map(restaurant.id, items)
+        ranked = _ranking_service.rank_top_menu(
+            profile=profile,
+            items=items,
+            n=body.top_n,
+            nutrition_map=nutrition_map,
+        )
+        recommendations = [
+            RecommendationItemResponse(
+                name=ranked_item.item.name,
+                score=ranked_item.score,
+                nutrition=ranked_item.nutrition,
+            )
+            for ranked_item in ranked
+        ]
+        _recommendation_cache.set(
+            profile.user_id,
+            restaurant.id,
+            [(item.name, item.score, item.nutrition) for item in recommendations],
+        )
+        results.append(
+            DiscoverRestaurantResult(
+                restaurant=restaurant,
+                recommendations=recommendations,
+            )
+        )
+
+    return DiscoverResponse(results=results)
+
+
+async def _build_nutrition_map(
+    restaurant_id: str,
+    items: list[MenuItem],
+    estimator: Estimator = Estimator.ai,
+) -> dict[str, NutritionEstimate]:
+    cached_map = _menu_nutrition_cache.get(restaurant_id) or {}
+    missing_items = [item for item in items if item.id not in cached_map]
+
+    if not missing_items:
+        return {item.id: cached_map[item.id] for item in items}
+
+    nutrition_map = dict(cached_map)
+    for item in missing_items:
+        nutrition_map[item.id] = await _nutrition_service.estimate_nutrition(
+            item, estimator=estimator
+        )
+
+    _menu_nutrition_cache.set(restaurant_id, nutrition_map)
+    return nutrition_map
+
+
+async def _get_restaurant_by_id(restaurant_id: str) -> Restaurant | None:
+    """
+    Resolve a restaurant by Google Place ID via Place Details API.
+
+    This keeps workflow endpoints (`/restaurants/{id}/menu`, `/recommendations`)
+    independent from client-side provider/extractor details.
+    """
+    if not _settings.google_places_api_key:
+        return None
+
+    resource_name = (
+        restaurant_id
+        if restaurant_id.startswith("places/")
+        else f"places/{restaurant_id}"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # First try Places API v1 details for both resource-name and plain IDs.
+            try:
+                response = await client.get(
+                    f"https://places.googleapis.com/v1/{resource_name}",
+                    headers={
+                        "X-Goog-Api-Key": _settings.google_places_api_key,
+                        "X-Goog-FieldMask": (
+                            "id,displayName,formattedAddress,location,types,"
+                            "rating,internationalPhoneNumber,websiteUri"
+                        ),
+                    },
+                )
+                response.raise_for_status()
+                data = response.json()
+
+                location = data.get("location", {})
+                lat = location.get("latitude")
+                lng = location.get("longitude")
+                name = data.get("displayName", {}).get("text")
+                if name is not None and lat is not None and lng is not None:
+                    return Restaurant(
+                        id=data.get("id", restaurant_id),
+                        name=name,
+                        address=data.get("formattedAddress", ""),
+                        location=Location(lat=float(lat), lng=float(lng)),
+                        cuisine_types=data.get("types", []),
+                        rating=data.get("rating"),
+                        phone=data.get("internationalPhoneNumber"),
+                        website=data.get("websiteUri"),
+                    )
+            except (httpx.HTTPError, ValueError):
+                # Fall back to legacy Place Details API.
+                pass
+
+            params = {
+                "place_id": restaurant_id,
+                "fields": (
+                    "place_id,name,formatted_address,geometry/location,"
+                    "types,rating,formatted_phone_number,website"
+                ),
+                "key": _settings.google_places_api_key,
+            }
+            response = await client.get(
+                "https://maps.googleapis.com/maps/api/place/details/json",
+                params=params,
+            )
+            response.raise_for_status()
+            data = response.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+
+    if data.get("status") != "OK":
+        return None
+
+    place = data.get("result", {})
+    geometry = place.get("geometry", {}).get("location", {})
+    lat = geometry.get("lat")
+    lng = geometry.get("lng")
+    name = place.get("name")
+    if name is None or lat is None or lng is None:
+        return None
+
+    return Restaurant(
+        id=place.get("place_id", restaurant_id),
+        name=name,
+        address=place.get("formatted_address", ""),
+        location=Location(lat=float(lat), lng=float(lng)),
+        cuisine_types=place.get("types", []),
+        rating=place.get("rating"),
+        phone=place.get("formatted_phone_number"),
+        website=place.get("website"),
+    )

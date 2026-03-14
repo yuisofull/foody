@@ -26,12 +26,14 @@ class _FakeExtractor(MenuExtractor):
     def __init__(self, name: str, items: list[MenuItem]) -> None:
         self._name = name
         self._items = items
+        self.calls = 0
 
     @property
     def name(self) -> str:
         return self._name
 
     async def extract(self, menu_url: str, provider: MenuProvider) -> list[MenuItem]:
+        self.calls += 1
         return self._items
 
 
@@ -49,8 +51,22 @@ def restaurant() -> Restaurant:
 @pytest.fixture
 def sample_items() -> list[MenuItem]:
     return [
-        MenuItem(id="i1", name="Beef Taco", price=5.50, description="Classic beef taco", category="Tacos", tags=[]),
-        MenuItem(id="i2", name="Veggie Taco", price=4.90, description="Fresh veggie taco", category="Tacos", tags=["vegan"]),
+        MenuItem(
+            id="i1",
+            name="Beef Taco",
+            price=5.50,
+            description="Classic beef taco",
+            category="Tacos",
+            tags=[],
+        ),
+        MenuItem(
+            id="i2",
+            name="Veggie Taco",
+            price=4.90,
+            description="Fresh veggie taco",
+            category="Tacos",
+            tags=["vegan"],
+        ),
     ]
 
 
@@ -70,7 +86,11 @@ class TestMenuService:
         ]
         service = _make_service(providers=providers)
         result = await service._extract_menu_url(restaurant)
-        assert result == ["https://a.com/menu1", "https://a.com/menu2", "https://b.com/menu"]
+        assert result == [
+            "https://a.com/menu1",
+            "https://a.com/menu2",
+            "https://b.com/menu",
+        ]
 
     @pytest.mark.asyncio
     async def test_extract_menu_url_deduplicates_urls(self, restaurant):
@@ -156,7 +176,22 @@ class TestMenuService:
         assert result == []
 
     @pytest.mark.asyncio
-    async def test_get_menu_items_uses_first_successful_url(self, restaurant, sample_items):
+    async def test_extract_menu_uses_cache_for_same_url(self, sample_items):
+        extractor = _FakeExtractor("Good", sample_items)
+        provider = _FakeProvider("P", ["https://example.com"])
+        service = _make_service(providers=[provider], extractors=[extractor])
+
+        first = await service.extract_menu("https://example.com/menu")
+        second = await service.extract_menu("https://example.com/menu")
+
+        assert first == sample_items
+        assert second == sample_items
+        assert extractor.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_get_menu_items_uses_first_successful_url(
+        self, restaurant, sample_items
+    ):
         provider = _FakeProvider("P", ["https://bad.com/menu", "https://good.com/menu"])
 
         call_log: list[str] = []
@@ -166,7 +201,9 @@ class TestMenuService:
             def name(self) -> str:
                 return "Tracking"
 
-            async def extract(self, menu_url: str, provider: MenuProvider) -> list[MenuItem]:
+            async def extract(
+                self, menu_url: str, provider: MenuProvider
+            ) -> list[MenuItem]:
                 call_log.append(menu_url)
                 if "good" in menu_url:
                     return sample_items
@@ -180,11 +217,12 @@ class TestMenuService:
         assert "https://good.com/menu" in call_log
 
     @pytest.mark.asyncio
-    async def test_providers_injected_not_passed_per_call(self, restaurant, sample_items):
+    async def test_providers_injected_not_passed_per_call(
+        self, restaurant, sample_items
+    ):
         """Providers are set once at construction; callers need not supply them."""
         provider = _FakeProvider("InjectedProvider", ["https://injected.com/menu"])
         extractor = _FakeExtractor("Good", sample_items)
         service = MenuService(providers=[provider], extractors=[extractor])
         result = await service.get_menu_items(restaurant)
         assert result == sample_items
-

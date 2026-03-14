@@ -8,8 +8,8 @@ AI-powered food discovery backend built with **Python + FastAPI**.
 |---|---|
 | `GetRestaurantNearby(location, radius)` | Finds nearby restaurants via Google Places API with TTL caching |
 | `ExtractMenuUrl(restaurant, providers)` | Resolves menu URLs from Menulog, DoorDash, or the restaurant's own site |
-| `ExtractMenu(url, provider, extractors)` | Parses menus using HTML parsing, AI (OpenAI), or OCR |
-| `EstimateNutrition(item, estimator)` | Estimates calories/macros via OpenAI or USDA FoodData Central |
+| `ExtractMenu(url, provider, extractors)` | Parses menus using HTML parsing, AI (Gemini), or OCR |
+| `EstimateNutrition(item, estimator)` | Estimates calories/macros via Gemini or USDA FoodData Central |
 | `AnalyzeUserPreferenceProfile(profile)` | Maps goals to calorie targets and macro splits |
 | `StoreUserProfile(profile)` | Persists user profiles (goal, macros, restrictions, budget, history) |
 | `RankingTopMenu(profile, items, N)` | Scores and returns the top-N items matched to the user's profile |
@@ -38,7 +38,7 @@ foody/
 │   │   └── restaurant_site.py
 │   ├── extractors/          # Menu content extractors
 │   │   ├── web_fetcher.py   # HTML parser
-│   │   ├── ai_extractor.py  # OpenAI-based
+│   │   ├── ai_extractor.py  # Gemini-based
 │   │   └── ocr_extractor.py # OCR stub
 │   └── cache/
 │       └── restaurant_cache.py  # TTL in-memory cache
@@ -67,7 +67,7 @@ cp .env.example .env
 
 Required API keys:
 - `GOOGLE_PLACES_API_KEY` – [Google Cloud Console](https://console.cloud.google.com/)
-- `OPENAI_API_KEY` – [OpenAI](https://platform.openai.com/)
+- `GEMINI_API_KEY` – [Google AI Studio](https://aistudio.google.com/)
 - `USDA_API_KEY` – [FoodData Central](https://fdc.nal.usda.gov/api-guide.html) (free)
 
 ### 3. Run the server
@@ -83,13 +83,12 @@ Interactive API docs: http://localhost:8000/docs
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/restaurants/nearby` | Find restaurants near a location |
-| `POST` | `/restaurant/menu-url` | Resolve a restaurant's menu URL |
-| `POST` | `/menu/extract` | Extract structured items from a menu URL |
-| `POST` | `/nutrition/estimate` | Estimate nutrition for a menu item |
-| `GET` | `/user/{user_id}/profile` | Retrieve a user profile |
-| `PUT` | `/user/{user_id}/profile` | Create or update a user profile |
-| `DELETE` | `/user/{user_id}/profile` | Delete a user profile |
-| `POST` | `/menu/rank` | Rank menu items for a user |
+| `GET` | `/restaurants/{restaurant_id}/menu` | Resolve and extract menu items for a restaurant |
+| `POST` | `/menu/nutrition` | Estimate nutrition for a list of menu items |
+| `POST` | `/users/profile` | Create or update a user profile |
+| `GET` | `/users/{user_id}` | Retrieve a user profile |
+| `POST` | `/recommendations` | Core recommendation flow: profile + menu + nutrition + ranking |
+| `POST` | `/discover` | Smart discovery: nearby restaurants with recommended dishes |
 
 ## Running Tests
 

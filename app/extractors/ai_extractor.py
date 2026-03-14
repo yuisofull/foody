@@ -5,7 +5,6 @@ import re
 import uuid
 
 import httpx
-from openai import AsyncOpenAI
 
 from app.config import get_settings
 from app.extractors.base import MenuExtractor
@@ -62,8 +61,8 @@ class AIMenuExtractor(MenuExtractor):
 
     def __init__(self) -> None:
         settings = get_settings()
-        self._client = AsyncOpenAI(api_key=settings.openai_api_key)
-        self._model = settings.openai_model
+        self._api_key = settings.gemini_api_key
+        self._model = settings.gemini_model
 
     @property
     def name(self) -> str:

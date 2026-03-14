@@ -25,9 +25,11 @@ def burger_item() -> MenuItem:
 def nutrition_service() -> NutritionService:
     with patch("app.services.nutrition_service.get_settings") as mock_settings:
         mock_settings.return_value = MagicMock(
-            openai_api_key="fake_key",
-            openai_model="gpt-4o-mini",
+            gemini_api_key="fake_key",
+            gemini_model="gemini-1.5-flash",
             usda_api_key="fake_usda_key",
+            nutrition_cache_maxsize=1000,
+            nutrition_cache_ttl=300,
         )
         return NutritionService()
 
@@ -36,16 +38,31 @@ class TestNutritionService:
     @pytest.mark.asyncio
     async def test_estimate_ai_returns_estimate(self, nutrition_service, burger_item):
         mock_response = MagicMock()
-        mock_response.choices = [
-            MagicMock(message=MagicMock(content='{"calories": 650, "protein": 35, "carbs": 48, "fat": 28}'))
-        ]
+        mock_response.json.return_value = {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "text": '{"calories": 650, "protein": 35, "carbs": 48, "fat": 28}'
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+        mock_response.raise_for_status = MagicMock()
 
-        nutrition_service._openai_client = AsyncMock()
-        nutrition_service._openai_client.chat = MagicMock()
-        nutrition_service._openai_client.chat.completions = AsyncMock()
-        nutrition_service._openai_client.chat.completions.create = AsyncMock(return_value=mock_response)
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_response)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_class.return_value = mock_client
 
-        result = await nutrition_service.estimate_nutrition(burger_item, Estimator.ai)
+            result = await nutrition_service.estimate_nutrition(
+                burger_item, Estimator.ai
+            )
 
         assert result.calories == 650.0
         assert result.protein == 35.0
@@ -55,14 +72,16 @@ class TestNutritionService:
 
     @pytest.mark.asyncio
     async def test_estimate_ai_handles_exception(self, nutrition_service, burger_item):
-        nutrition_service._openai_client = AsyncMock()
-        nutrition_service._openai_client.chat = MagicMock()
-        nutrition_service._openai_client.chat.completions = AsyncMock()
-        nutrition_service._openai_client.chat.completions.create = AsyncMock(
-            side_effect=Exception("API error")
-        )
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(side_effect=Exception("API error"))
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_class.return_value = mock_client
 
-        result = await nutrition_service.estimate_nutrition(burger_item, Estimator.ai)
+            result = await nutrition_service.estimate_nutrition(
+                burger_item, Estimator.ai
+            )
 
         assert result.confidence == NutritionConfidence.estimated
         assert result.calories is None
@@ -71,9 +90,11 @@ class TestNutritionService:
     async def test_estimate_usda_no_api_key(self, burger_item):
         with patch("app.services.nutrition_service.get_settings") as mock_settings:
             mock_settings.return_value = MagicMock(
-                openai_api_key="",
-                openai_model="gpt-4o-mini",
+                gemini_api_key="",
+                gemini_model="gemini-1.5-flash",
                 usda_api_key="",
+                nutrition_cache_maxsize=1000,
+                nutrition_cache_ttl=300,
             )
             service = NutritionService()
 
@@ -108,8 +129,49 @@ class TestNutritionService:
             mock_client.__aexit__ = AsyncMock(return_value=None)
             mock_client_class.return_value = mock_client
 
-            result = await nutrition_service.estimate_nutrition(burger_item, Estimator.usda)
+            result = await nutrition_service.estimate_nutrition(
+                burger_item, Estimator.usda
+            )
 
         assert result.calories == 303.0
         assert result.protein == 14.9
         assert result.confidence == NutritionConfidence.verified
+
+    @pytest.mark.asyncio
+    async def test_estimate_ai_uses_cache_by_item_hash(
+        self, nutrition_service, burger_item
+    ):
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "text": '{"calories": 500, "protein": 20, "carbs": 30, "fat": 10}'
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+        mock_response.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            create_mock = AsyncMock(return_value=mock_response)
+            mock_client = AsyncMock()
+            mock_client.post = create_mock
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_class.return_value = mock_client
+
+            first = await nutrition_service.estimate_nutrition(
+                burger_item, Estimator.ai
+            )
+            second = await nutrition_service.estimate_nutrition(
+                burger_item, Estimator.ai
+            )
+
+        assert first.calories == 500.0
+        assert second.calories == 500.0
+        assert create_mock.await_count == 1

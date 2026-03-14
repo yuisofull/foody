@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from enum import Enum
 
 import httpx
-from openai import AsyncOpenAI
 
+from app.cache.nutrition_cache import NutritionEstimationCache
 from app.config import get_settings
 from app.models.menu import MenuItem
 from app.models.nutrition import NutritionConfidence, NutritionEstimate
@@ -37,9 +38,13 @@ class NutritionService:
 
     def __init__(self) -> None:
         settings = get_settings()
-        self._openai_client = AsyncOpenAI(api_key=settings.openai_api_key)
-        self._openai_model = settings.openai_model
+        self._gemini_api_key = settings.gemini_api_key
+        self._gemini_model = settings.gemini_model
         self._usda_api_key = settings.usda_api_key
+        self._nutrition_cache = NutritionEstimationCache(
+            maxsize=settings.nutrition_cache_maxsize,
+            ttl=settings.nutrition_cache_ttl,
+        )
 
     async def estimate_nutrition(
         self,
@@ -56,24 +61,53 @@ class NutritionService:
         Returns:
             A NutritionEstimate with calorie/macro values and a confidence level.
         """
+        item_hash = _build_item_hash(item)
+        cache_key = f"{item_hash}:{estimator.value}"
+        cached = self._nutrition_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         if estimator == Estimator.usda:
-            return await self._estimate_usda(item)
-        return await self._estimate_ai(item)
+            estimate = await self._estimate_usda(item)
+        else:
+            estimate = await self._estimate_ai(item)
+
+        self._nutrition_cache.set(cache_key, estimate)
+        return estimate
 
     async def _estimate_ai(self, item: MenuItem) -> NutritionEstimate:
+        if not self._gemini_api_key:
+            return NutritionEstimate(confidence=NutritionConfidence.estimated)
+
         description = item.description or ""
-        user_content = f"Item: {item.name}\nDescription: {description}"
+        user_content = f"Item: {item.name}\\nDescription: {description}"
+        payload = {
+            "system_instruction": {
+                "parts": [{"text": _AI_SYSTEM_PROMPT}],
+            },
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": user_content}],
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0,
+                "responseMimeType": "application/json",
+            },
+        }
+
         try:
-            response = await self._openai_client.chat.completions.create(
-                model=self._openai_model,
-                messages=[
-                    {"role": "system", "content": _AI_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_content},
-                ],
-                temperature=0,
-                response_format={"type": "json_object"},
-            )
-            raw = response.choices[0].message.content or ""
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                response = await client.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{self._gemini_model}:generateContent",
+                    params={"key": self._gemini_api_key},
+                    json=payload,
+                )
+                response.raise_for_status()
+                data = response.json()
+
+            raw = _extract_gemini_text(data)
             data = json.loads(raw)
             return NutritionEstimate(
                 calories=_to_float(data.get("calories")),
@@ -106,7 +140,9 @@ class NutritionService:
                 return NutritionEstimate(confidence=NutritionConfidence.estimated)
 
             food = foods[0]
-            nutrients = {n["nutrientName"]: n["value"] for n in food.get("foodNutrients", [])}
+            nutrients = {
+                n["nutrientName"]: n["value"] for n in food.get("foodNutrients", [])
+            }
 
             return NutritionEstimate(
                 calories=_to_float(nutrients.get("Energy")),
@@ -118,6 +154,10 @@ class NutritionService:
         except (httpx.HTTPError, ValueError, KeyError):
             return NutritionEstimate(confidence=NutritionConfidence.estimated)
 
+    @property
+    def cache_stats(self) -> dict[str, int]:
+        return self._nutrition_cache.stats
+
 
 def _to_float(value: object) -> float | None:
     if value is None:
@@ -126,3 +166,33 @@ def _to_float(value: object) -> float | None:
         return float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+
+
+def _build_item_hash(item: MenuItem) -> str:
+    payload = f"{item.name.strip().lower()}|{(item.description or '').strip().lower()}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _extract_gemini_text(payload: dict) -> str:
+    candidates = payload.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        return ""
+
+    first = candidates[0]
+    content = first.get("content", {}) if isinstance(first, dict) else {}
+    parts = content.get("parts", []) if isinstance(content, dict) else []
+    if not isinstance(parts, list):
+        return ""
+
+    chunks: list[str] = []
+    for part in parts:
+        if isinstance(part, dict):
+            text = part.get("text")
+            if isinstance(text, str):
+                chunks.append(text)
+
+    raw = "\n".join(chunks).strip()
+    if raw.startswith("```"):
+        lines = [line for line in raw.splitlines() if not line.startswith("```")]
+        return "\n".join(lines).strip()
+    return raw

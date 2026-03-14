@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 import pytest_asyncio
+import httpx
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -168,6 +169,9 @@ class TestRestaurantService:
                 mock_response.raise_for_status = MagicMock()
 
                 mock_client = AsyncMock()
+                mock_client.post = AsyncMock(
+                    side_effect=httpx.HTTPError("new api unavailable")
+                )
                 mock_client.get = AsyncMock(return_value=mock_response)
                 mock_client.__aenter__ = AsyncMock(return_value=mock_client)
                 mock_client.__aexit__ = AsyncMock(return_value=None)

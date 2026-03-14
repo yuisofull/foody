@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from app.cache.menu_cache import MenuExtractionCache
 from app.extractors.base import MenuExtractor
 from app.models.menu import MenuItem
 from app.models.restaurant import Restaurant
@@ -19,9 +20,11 @@ class MenuService:
         self,
         providers: list[MenuProvider],
         extractors: list[MenuExtractor],
+        menu_cache: MenuExtractionCache | None = None,
     ) -> None:
         self._providers = providers
         self._extractors = extractors
+        self._menu_cache = menu_cache or MenuExtractionCache()
 
     async def _extract_menu_url(self, restaurant: Restaurant) -> list[str]:
         """
@@ -51,13 +54,19 @@ class MenuService:
         Returns:
             A list of MenuItem objects (may be empty if all extractors fail).
         """
+        cached = self._menu_cache.get(menu_url)
+        if cached is not None:
+            return cached
+
         # Use the first injected provider as context for extractors; fall back
         # to RestaurantSiteProvider when no providers were configured.
         provider = self._providers[0] if self._providers else RestaurantSiteProvider()
         for extractor in self._extractors:
             items = await extractor.extract(menu_url, provider)
             if items:
+                self._menu_cache.set(menu_url, items)
                 return items
+        self._menu_cache.set(menu_url, [])
         return []
 
     async def get_menu_items(self, restaurant: Restaurant) -> list[MenuItem]:
@@ -80,3 +89,14 @@ class MenuService:
             if items:
                 return items
         return []
+
+    async def invalidate_restaurant_cache(self, restaurant: Restaurant) -> int:
+        """Invalidate extracted-menu cache entries associated with a restaurant."""
+        urls = await self._extract_menu_url(restaurant)
+        for url in urls:
+            self._menu_cache.invalidate(url)
+        return len(urls)
+
+    @property
+    def cache_stats(self) -> dict[str, int]:
+        return self._menu_cache.stats

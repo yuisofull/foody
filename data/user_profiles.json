@@ -1,0 +1,20 @@
+{
+  "demo_user_001": {
+    "user_id": "demo_user_001",
+    "goal_type": "muscle_gain",
+    "cal_target": 2800.0,
+    "macro_splits": {
+      "protein": 0.35,
+      "carbs": 0.45,
+      "fat": 0.2
+    },
+    "restrictions": [],
+    "budget_max": 30.0,
+    "cuisine_preferences": [
+      "Japanese",
+      "Mediterranean"
+    ],
+    "liked_items": [],
+    "disliked_items": []
+  }
+}
