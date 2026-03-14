@@ -3,6 +3,7 @@ uvicorn[standard]==0.34.3
 pydantic==2.10.6
 pydantic-settings==2.8.1
 httpx==0.28.1
+google-genai==0.8.0
 beautifulsoup4==4.12.3
 cachetools==5.5.2
 python-dotenv==1.2.2

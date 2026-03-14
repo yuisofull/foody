@@ -13,12 +13,14 @@ class _FakeProvider(MenuProvider):
     def __init__(self, name: str, urls: list[str]) -> None:
         self._name = name
         self._urls = urls
+        self.calls = 0
 
     @property
     def name(self) -> str:
         return self._name
 
     async def get_menu_url(self, restaurant: Restaurant) -> list[str]:
+        self.calls += 1
         return self._urls
 
 
@@ -166,6 +168,22 @@ class TestMenuService:
         result = await service.get_menu_items(restaurant)
         assert len(result) == 2
         assert result[0].name == "Beef Taco"
+
+    @pytest.mark.asyncio
+    async def test_get_menu_items_uses_service_cache_by_restaurant(
+        self, restaurant, sample_items
+    ):
+        provider = _FakeProvider("P", ["https://example.com/menu"])
+        extractor = _FakeExtractor("Good", sample_items)
+        service = _make_service(providers=[provider], extractors=[extractor])
+
+        first = await service.get_menu_items(restaurant)
+        second = await service.get_menu_items(restaurant)
+
+        assert first == sample_items
+        assert second == sample_items
+        assert provider.calls == 1
+        assert extractor.calls == 1
 
     @pytest.mark.asyncio
     async def test_get_menu_items_no_urls_returns_empty(self, restaurant):

@@ -16,9 +16,9 @@ class RestaurantService:
     Falls back to an empty list if no API key is set.
     """
 
-    PLACES_NEARBY_URL = (
-        "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
-    )
+    PLACES_NEARBY_URL = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
+    PLACE_DETAILS_URL = "https://maps.googleapis.com/maps/api/place/details/json"
+    PLACE_DETAILS_NEW_URL = "https://places.googleapis.com/v1"
     PLACES_NEARBY_NEW_URL = "https://places.googleapis.com/v1/places:searchNearby"
     PLACES_FIELD_MASK = (
         "places.id,places.displayName,places.formattedAddress,places.location,"
@@ -57,6 +57,88 @@ class RestaurantService:
         restaurants = await self._fetch_from_google(location, radius)
         self._cache.set(location, radius, restaurants)
         return restaurants
+
+    async def get_restaurant_by_id(self, restaurant_id: str) -> Restaurant | None:
+        """Resolve a restaurant by Google Place ID or Places API v1 resource name."""
+        if not self._api_key:
+            return None
+
+        resource_name = (
+            restaurant_id
+            if restaurant_id.startswith("places/")
+            else f"places/{restaurant_id}"
+        )
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                # Try Places API v1 details first.
+                try:
+                    response = await client.get(
+                        f"{self.PLACE_DETAILS_NEW_URL}/{resource_name}",
+                        headers={
+                            "X-Goog-Api-Key": self._api_key,
+                            "X-Goog-FieldMask": (
+                                "id,displayName,formattedAddress,location,types,"
+                                "rating,internationalPhoneNumber,websiteUri"
+                            ),
+                        },
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+
+                    location = data.get("location", {})
+                    lat = location.get("latitude")
+                    lng = location.get("longitude")
+                    name = data.get("displayName", {}).get("text")
+                    if name is not None and lat is not None and lng is not None:
+                        return Restaurant(
+                            id=data.get("id", restaurant_id),
+                            name=name,
+                            address=data.get("formattedAddress", ""),
+                            location=Location(lat=float(lat), lng=float(lng)),
+                            cuisine_types=data.get("types", []),
+                            rating=data.get("rating"),
+                            phone=data.get("internationalPhoneNumber"),
+                            website=data.get("websiteUri"),
+                        )
+                except (httpx.HTTPError, ValueError):
+                    pass
+
+                params = {
+                    "place_id": restaurant_id,
+                    "fields": (
+                        "place_id,name,formatted_address,geometry/location,"
+                        "types,rating,formatted_phone_number,website"
+                    ),
+                    "key": self._api_key,
+                }
+                response = await client.get(self.PLACE_DETAILS_URL, params=params)
+                response.raise_for_status()
+                data = response.json()
+        except (httpx.HTTPError, ValueError):
+            return None
+
+        if data.get("status") != "OK":
+            return None
+
+        place = data.get("result", {})
+        geometry = place.get("geometry", {}).get("location", {})
+        lat = geometry.get("lat")
+        lng = geometry.get("lng")
+        name = place.get("name")
+        if name is None or lat is None or lng is None:
+            return None
+
+        return Restaurant(
+            id=place.get("place_id", restaurant_id),
+            name=name,
+            address=place.get("formatted_address", ""),
+            location=Location(lat=float(lat), lng=float(lng)),
+            cuisine_types=place.get("types", []),
+            rating=place.get("rating"),
+            phone=place.get("formatted_phone_number"),
+            website=place.get("website"),
+        )
 
     async def _fetch_from_google(
         self,
@@ -112,7 +194,9 @@ class RestaurantService:
 
         places = data.get("places")
         if places is None:
-            error_message = data.get("error", {}).get("message") if isinstance(data, dict) else None
+            error_message = (
+                data.get("error", {}).get("message") if isinstance(data, dict) else None
+            )
             self._logger.warning(
                 "Places API (New) unavailable or denied; falling back to legacy API. error=%s",
                 error_message,

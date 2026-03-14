@@ -29,7 +29,7 @@ class Settings(BaseSettings):
             os.getenv("gemini_api_key") or os.getenv("GEMINI_API_KEY") or ""
         )
     )
-    gemini_model: str = "gemini-1.5-flash"
+    gemini_model: str = "gemma-3-27b-it"
     usda_api_key: str = ""
     user_profile_storage_path: str = "./data/user_profiles.json"
     restaurant_cache_ttl: int = 300

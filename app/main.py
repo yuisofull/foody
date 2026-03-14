@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from app.cache.menu_cache import MenuExtractionCache
-from app.cache.menu_nutrition_cache import MenuNutritionCache
-from app.cache.recommendation_cache import RecommendationCache
 from app.cache.restaurant_cache import RestaurantCache
 from app.config import get_settings
 from app.extractors.ai_extractor import AIMenuExtractor
@@ -21,6 +18,7 @@ from app.providers.menulog import MenulogProvider
 from app.providers.restaurant_site import RestaurantSiteProvider
 from app.services.menu_service import MenuService
 from app.services.nutrition_service import Estimator, NutritionService
+from app.services.recommendation_service import RecommendationService
 from app.services.ranking_service import RankingService
 from app.services.restaurant_service import RestaurantService
 from app.services.user_service import UserService
@@ -47,14 +45,6 @@ _menu_cache = MenuExtractionCache(
     maxsize=_settings.menu_cache_maxsize,
     ttl=_settings.menu_cache_ttl,
 )
-_menu_nutrition_cache = MenuNutritionCache(
-    maxsize=_settings.menu_nutrition_cache_maxsize,
-    ttl=_settings.menu_nutrition_cache_ttl,
-)
-_recommendation_cache = RecommendationCache(
-    maxsize=_settings.recommendation_cache_maxsize,
-    ttl=_settings.recommendation_cache_ttl,
-)
 _restaurant_service = RestaurantService(cache=_cache)
 _default_providers = [
     MenulogProvider(),
@@ -62,7 +52,7 @@ _default_providers = [
     RestaurantSiteProvider(),
 ]
 _default_extractors = [
-    WebFetchExtractor(),
+    # WebFetchExtractor(),
     AIMenuExtractor(),
     OCRExtractor(),
 ]
@@ -74,6 +64,11 @@ _menu_service = MenuService(
 _nutrition_service = NutritionService()
 _user_service = UserService()
 _ranking_service = RankingService()
+_recommendation_service = RecommendationService(
+    menu_service=_menu_service,
+    nutrition_service=_nutrition_service,
+    ranking_service=_ranking_service,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +173,7 @@ async def get_nearby_restaurants(body: NearbyRequest) -> list[Restaurant]:
 @app.get("/restaurants/{restaurant_id}/menu", response_model=RestaurantMenuResponse)
 async def get_restaurant_menu(restaurant_id: str) -> RestaurantMenuResponse:
     """Lookup a restaurant by ID and return extracted menu items."""
-    restaurant = await _get_restaurant_by_id(restaurant_id)
+    restaurant = await _restaurant_service.get_restaurant_by_id(restaurant_id)
     if restaurant is None:
         raise HTTPException(status_code=404, detail="Restaurant not found")
 
@@ -214,8 +209,7 @@ async def upsert_user_profile(profile: UpsertUserProfileRequest) -> UserProfile:
     """StoreUserProfile + AnalyzeUserPreferenceProfile"""
     enriched = _user_service.analyze_user_preference_profile(profile)
     _user_service.store_user_profile(enriched)
-    _recommendation_cache.invalidate_user(enriched.user_id)
-    _user_service.invalidate_profile_cache(enriched.user_id)
+    _recommendation_service.invalidate_user_cache(enriched.user_id)
     return enriched
 
 
@@ -236,41 +230,20 @@ async def recommend_menu(body: RecommendationRequest) -> RecommendationResponse:
     if profile is None:
         raise HTTPException(status_code=404, detail="User profile not found")
 
-    restaurant = await _get_restaurant_by_id(body.restaurant_id)
+    restaurant = await _restaurant_service.get_restaurant_by_id(body.restaurant_id)
     if restaurant is None:
         raise HTTPException(status_code=404, detail="Restaurant not found")
 
-    cached_recommendations = _recommendation_cache.get(body.user_id, body.restaurant_id)
-    if cached_recommendations is not None and len(cached_recommendations) >= body.top_n:
-        return RecommendationResponse(
-            restaurant_id=body.restaurant_id,
-            recommendations=[
-                RecommendationItemResponse(name=name, score=score, nutrition=nutrition)
-                for name, score, nutrition in cached_recommendations[: body.top_n]
-            ],
-        )
-
-    items = await _menu_service.get_menu_items(restaurant)
-    nutrition_map = await _build_nutrition_map(body.restaurant_id, items)
-    ranked = _ranking_service.rank_top_menu(
+    recommendations_data = await _recommendation_service.recommend_for_restaurant(
         profile=profile,
-        items=items,
-        n=body.top_n,
-        nutrition_map=nutrition_map,
+        restaurant=restaurant,
+        top_n=body.top_n,
     )
+
     recommendations = [
-        RecommendationItemResponse(
-            name=ranked_item.item.name,
-            score=ranked_item.score,
-            nutrition=ranked_item.nutrition,
-        )
-        for ranked_item in ranked
+        RecommendationItemResponse(name=name, score=score, nutrition=nutrition)
+        for name, score, nutrition in recommendations_data
     ]
-    _recommendation_cache.set(
-        body.user_id,
-        body.restaurant_id,
-        [(item.name, item.score, item.nutrition) for item in recommendations],
-    )
 
     return RecommendationResponse(
         restaurant_id=body.restaurant_id,
@@ -293,49 +266,16 @@ async def discover(body: DiscoverRequest) -> DiscoverResponse:
 
     results: list[DiscoverRestaurantResult] = []
     for restaurant in restaurants:
-        cached_recommendations = _recommendation_cache.get(
-            profile.user_id, restaurant.id
-        )
-        if (
-            cached_recommendations is not None
-            and len(cached_recommendations) >= body.top_n
-        ):
-            results.append(
-                DiscoverRestaurantResult(
-                    restaurant=restaurant,
-                    recommendations=[
-                        RecommendationItemResponse(
-                            name=name, score=score, nutrition=nutrition
-                        )
-                        for name, score, nutrition in cached_recommendations[
-                            : body.top_n
-                        ]
-                    ],
-                )
-            )
-            continue
-
-        items = await _menu_service.get_menu_items(restaurant)
-        nutrition_map = await _build_nutrition_map(restaurant.id, items)
-        ranked = _ranking_service.rank_top_menu(
+        recommendations_data = await _recommendation_service.recommend_for_restaurant(
             profile=profile,
-            items=items,
-            n=body.top_n,
-            nutrition_map=nutrition_map,
+            restaurant=restaurant,
+            top_n=body.top_n,
         )
+
         recommendations = [
-            RecommendationItemResponse(
-                name=ranked_item.item.name,
-                score=ranked_item.score,
-                nutrition=ranked_item.nutrition,
-            )
-            for ranked_item in ranked
+            RecommendationItemResponse(name=name, score=score, nutrition=nutrition)
+            for name, score, nutrition in recommendations_data
         ]
-        _recommendation_cache.set(
-            profile.user_id,
-            restaurant.id,
-            [(item.name, item.score, item.nutrition) for item in recommendations],
-        )
         results.append(
             DiscoverRestaurantResult(
                 restaurant=restaurant,
@@ -344,116 +284,3 @@ async def discover(body: DiscoverRequest) -> DiscoverResponse:
         )
 
     return DiscoverResponse(results=results)
-
-
-async def _build_nutrition_map(
-    restaurant_id: str,
-    items: list[MenuItem],
-    estimator: Estimator = Estimator.ai,
-) -> dict[str, NutritionEstimate]:
-    cached_map = _menu_nutrition_cache.get(restaurant_id) or {}
-    missing_items = [item for item in items if item.id not in cached_map]
-
-    if not missing_items:
-        return {item.id: cached_map[item.id] for item in items}
-
-    nutrition_map = dict(cached_map)
-    for item in missing_items:
-        nutrition_map[item.id] = await _nutrition_service.estimate_nutrition(
-            item, estimator=estimator
-        )
-
-    _menu_nutrition_cache.set(restaurant_id, nutrition_map)
-    return nutrition_map
-
-
-async def _get_restaurant_by_id(restaurant_id: str) -> Restaurant | None:
-    """
-    Resolve a restaurant by Google Place ID via Place Details API.
-
-    This keeps workflow endpoints (`/restaurants/{id}/menu`, `/recommendations`)
-    independent from client-side provider/extractor details.
-    """
-    if not _settings.google_places_api_key:
-        return None
-
-    resource_name = (
-        restaurant_id
-        if restaurant_id.startswith("places/")
-        else f"places/{restaurant_id}"
-    )
-
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            # First try Places API v1 details for both resource-name and plain IDs.
-            try:
-                response = await client.get(
-                    f"https://places.googleapis.com/v1/{resource_name}",
-                    headers={
-                        "X-Goog-Api-Key": _settings.google_places_api_key,
-                        "X-Goog-FieldMask": (
-                            "id,displayName,formattedAddress,location,types,"
-                            "rating,internationalPhoneNumber,websiteUri"
-                        ),
-                    },
-                )
-                response.raise_for_status()
-                data = response.json()
-
-                location = data.get("location", {})
-                lat = location.get("latitude")
-                lng = location.get("longitude")
-                name = data.get("displayName", {}).get("text")
-                if name is not None and lat is not None and lng is not None:
-                    return Restaurant(
-                        id=data.get("id", restaurant_id),
-                        name=name,
-                        address=data.get("formattedAddress", ""),
-                        location=Location(lat=float(lat), lng=float(lng)),
-                        cuisine_types=data.get("types", []),
-                        rating=data.get("rating"),
-                        phone=data.get("internationalPhoneNumber"),
-                        website=data.get("websiteUri"),
-                    )
-            except (httpx.HTTPError, ValueError):
-                # Fall back to legacy Place Details API.
-                pass
-
-            params = {
-                "place_id": restaurant_id,
-                "fields": (
-                    "place_id,name,formatted_address,geometry/location,"
-                    "types,rating,formatted_phone_number,website"
-                ),
-                "key": _settings.google_places_api_key,
-            }
-            response = await client.get(
-                "https://maps.googleapis.com/maps/api/place/details/json",
-                params=params,
-            )
-            response.raise_for_status()
-            data = response.json()
-    except (httpx.HTTPError, ValueError):
-        return None
-
-    if data.get("status") != "OK":
-        return None
-
-    place = data.get("result", {})
-    geometry = place.get("geometry", {}).get("location", {})
-    lat = geometry.get("lat")
-    lng = geometry.get("lng")
-    name = place.get("name")
-    if name is None or lat is None or lng is None:
-        return None
-
-    return Restaurant(
-        id=place.get("place_id", restaurant_id),
-        name=name,
-        address=place.get("formatted_address", ""),
-        location=Location(lat=float(lat), lng=float(lng)),
-        cuisine_types=place.get("types", []),
-        rating=place.get("rating"),
-        phone=place.get("formatted_phone_number"),
-        website=place.get("website"),
-    )

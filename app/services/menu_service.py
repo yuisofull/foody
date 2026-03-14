@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from cachetools import TTLCache
+
 from app.cache.menu_cache import MenuExtractionCache
 from app.extractors.base import MenuExtractor
 from app.models.menu import MenuItem
@@ -21,10 +23,16 @@ class MenuService:
         providers: list[MenuProvider],
         extractors: list[MenuExtractor],
         menu_cache: MenuExtractionCache | None = None,
+        restaurant_menu_cache_maxsize: int = 2000,
+        restaurant_menu_cache_ttl: int = 300,
     ) -> None:
         self._providers = providers
         self._extractors = extractors
         self._menu_cache = menu_cache or MenuExtractionCache()
+        self._restaurant_menu_cache: TTLCache[str, list[MenuItem]] = TTLCache(
+            maxsize=restaurant_menu_cache_maxsize,
+            ttl=restaurant_menu_cache_ttl,
+        )
 
     async def _extract_menu_url(self, restaurant: Restaurant) -> list[str]:
         """
@@ -83,15 +91,23 @@ class MenuService:
         Returns:
             A list of MenuItem objects (may be empty if no items are found).
         """
+        cached_menu = self._restaurant_menu_cache.get(restaurant.id)
+        if cached_menu is not None:
+            return cached_menu
+
         urls = await self._extract_menu_url(restaurant)
         for url in urls:
             items = await self.extract_menu(url)
             if items:
+                self._restaurant_menu_cache[restaurant.id] = items
                 return items
+
+        self._restaurant_menu_cache[restaurant.id] = []
         return []
 
     async def invalidate_restaurant_cache(self, restaurant: Restaurant) -> int:
         """Invalidate extracted-menu cache entries associated with a restaurant."""
+        self._restaurant_menu_cache.pop(restaurant.id, None)
         urls = await self._extract_menu_url(restaurant)
         for url in urls:
             self._menu_cache.invalidate(url)

@@ -5,10 +5,12 @@ import re
 import uuid
 
 import httpx
+import google.genai as genai
+from google.genai import types
 
 from app.config import get_settings
 from app.extractors.base import MenuExtractor
-from app.models.menu import MenuItem
+from app.models.menu import MenuItem, NutritionConfidence as MenuNutritionConfidence
 from app.providers.base import MenuProvider
 
 
@@ -61,7 +63,7 @@ class AIMenuExtractor(MenuExtractor):
 
     def __init__(self) -> None:
         settings = get_settings()
-        self._api_key = settings.gemini_api_key
+        self._client = genai.Client(api_key=settings.gemini_api_key)
         self._model = settings.gemini_model
 
     @property
@@ -124,16 +126,16 @@ Page content:
 """
 
         try:
-            response = await self._client.chat.completions.create(
+            response = await self._client.aio.models.generate_content(
                 model=self._model,
-                messages=[
-                    {"role": "system", "content": _SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0,
-                response_format={"type": "json_object"},
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0,
+                    response_mime_type="application/json",
+                    system_instruction=_SYSTEM_PROMPT,
+                ),
             )
-            raw = response.choices[0].message.content or ""
+            raw = _extract_response_text(response)
             return self._parse_response(raw)
         except Exception:
             return []
@@ -173,10 +175,18 @@ Page content:
                         description=self._clean_string(entry.get("description")),
                         category=self._clean_string(entry.get("category")),
                         tags=self._parse_tags(entry.get("tags")),
-                        estimated_calories_kcal=self._parse_int(entry.get("estimated_calories_kcal")),
-                        estimated_protein_g=self._parse_float(entry.get("estimated_protein_g")),
-                        nutrition_confidence=self._parse_confidence(entry.get("nutrition_confidence")),
-                        nutrition_notes=self._clean_string(entry.get("nutrition_notes")),
+                        estimated_calories_kcal=self._parse_int(
+                            entry.get("estimated_calories_kcal")
+                        ),
+                        estimated_protein_g=self._parse_float(
+                            entry.get("estimated_protein_g")
+                        ),
+                        nutrition_confidence=self._parse_confidence(
+                            entry.get("nutrition_confidence")
+                        ),
+                        nutrition_notes=self._clean_string(
+                            entry.get("nutrition_notes")
+                        ),
                     )
                 )
 
@@ -241,12 +251,39 @@ Page content:
             return None
         return int(round(parsed))
 
-    def _parse_confidence(self, value: object) -> str | None:
+    def _parse_confidence(self, value: object) -> MenuNutritionConfidence | None:
         text = self._clean_string(value)
         if not text:
             return None
 
         normalized = text.lower()
-        if normalized in {"high", "medium", "low"}:
-            return normalized
+        if normalized == "high":
+            return MenuNutritionConfidence.high
+        if normalized == "medium":
+            return MenuNutritionConfidence.medium
+        if normalized == "low":
+            return MenuNutritionConfidence.low
         return None
+
+
+def _extract_response_text(response: object) -> str:
+    text = getattr(response, "text", None)
+    if isinstance(text, str) and text.strip():
+        return text
+
+    candidates = getattr(response, "candidates", None)
+    if not isinstance(candidates, list) or not candidates:
+        return ""
+
+    first = candidates[0]
+    content = getattr(first, "content", None)
+    parts = getattr(content, "parts", None)
+    if not isinstance(parts, list):
+        return ""
+
+    chunks: list[str] = []
+    for part in parts:
+        part_text = getattr(part, "text", None)
+        if isinstance(part_text, str) and part_text.strip():
+            chunks.append(part_text)
+    return "\n".join(chunks).strip()
