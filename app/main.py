@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+from contextlib import suppress
+from datetime import datetime, timezone
+from enum import Enum
+from uuid import uuid4
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
@@ -145,13 +151,150 @@ class RecommendationResponse(BaseModel):
     recommendations: list[RecommendationItemResponse]
 
 
-class DiscoverRestaurantResult(BaseModel):
-    restaurant: Restaurant
-    recommendations: list[RecommendationItemResponse]
+class DiscoverItemResponse(BaseModel):
+    restaurant_id: str
+    restaurant_name: str
+    name: str
+    score: float
+    nutrition: NutritionEstimate | None
 
 
 class DiscoverResponse(BaseModel):
-    results: list[DiscoverRestaurantResult]
+    recommendations: list[DiscoverItemResponse]
+
+
+class DiscoverJobStatus(str, Enum):
+    queued = "queued"
+    running = "running"
+    completed = "completed"
+    failed = "failed"
+
+
+class DiscoverEnqueueResponse(BaseModel):
+    job_id: str
+    status: DiscoverJobStatus
+    poll_url: str
+
+
+class DiscoverJobResponse(BaseModel):
+    job_id: str
+    status: DiscoverJobStatus
+    created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    result: DiscoverResponse | None = None
+    error: str | None = None
+
+
+class _DiscoverJobRecord(BaseModel):
+    job_id: str
+    request: DiscoverRequest
+    status: DiscoverJobStatus
+    created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    result: DiscoverResponse | None = None
+    error: str | None = None
+
+
+_discover_jobs: dict[str, _DiscoverJobRecord] = {}
+_discover_queue: asyncio.Queue[str] | None = None
+_discover_worker_task: asyncio.Task[None] | None = None
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+async def _compute_discover(body: DiscoverRequest) -> DiscoverResponse:
+    restaurants = await _restaurant_service.get_nearby_restaurants(
+        body.location, body.radius
+    )
+    profile = body.profile
+    if not profile:
+        return DiscoverResponse(recommendations=[])
+
+    all_items: list[MenuItem] = []
+    item_restaurant_map: dict[str, Restaurant] = {}
+    for restaurant in restaurants:
+        menu_items = await _menu_service.get_menu_items(restaurant)
+        for item in menu_items:
+            scoped_item = item.model_copy(update={"id": f"{restaurant.id}:{item.id}"})
+            all_items.append(scoped_item)
+            item_restaurant_map[scoped_item.id] = restaurant
+
+    if not all_items:
+        return DiscoverResponse(recommendations=[])
+
+    ranked_items = await _recommendation_service.recommend_for_items(
+        profile=profile,
+        items=all_items,
+        top_n=body.top_n,
+    )
+
+    recommendations: list[DiscoverItemResponse] = []
+    for item_id, score, nutrition, item_name in ranked_items:
+        restaurant = item_restaurant_map.get(item_id)
+        if restaurant is None:
+            continue
+        recommendations.append(
+            DiscoverItemResponse(
+                restaurant_id=restaurant.id,
+                restaurant_name=restaurant.name,
+                name=item_name,
+                score=score,
+                nutrition=nutrition,
+            )
+        )
+
+    return DiscoverResponse(recommendations=recommendations)
+
+
+async def _discover_worker(queue: asyncio.Queue[str]) -> None:
+    while True:
+        job_id = await queue.get()
+        job = _discover_jobs.get(job_id)
+        if job is None:
+            queue.task_done()
+            continue
+
+        job.status = DiscoverJobStatus.running
+        job.started_at = _utc_now()
+        _discover_jobs[job_id] = job
+
+        try:
+            job.result = await _compute_discover(job.request)
+            job.status = DiscoverJobStatus.completed
+            job.error = None
+        except Exception as exc:
+            job.status = DiscoverJobStatus.failed
+            job.error = str(exc)
+        finally:
+            job.finished_at = _utc_now()
+            _discover_jobs[job_id] = job
+            queue.task_done()
+
+
+@app.on_event("startup")
+async def _start_discover_worker() -> None:
+    global _discover_queue, _discover_worker_task
+    _discover_queue = asyncio.Queue()
+    if _discover_worker_task is None or _discover_worker_task.done():
+        _discover_worker_task = asyncio.create_task(_discover_worker(_discover_queue))
+
+
+@app.on_event("shutdown")
+async def _stop_discover_worker() -> None:
+    global _discover_queue, _discover_worker_task
+    if _discover_worker_task is None:
+        _discover_queue = None
+        return
+
+    _discover_worker_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await _discover_worker_task
+    _discover_worker_task = None
+    _discover_queue = None
 
 
 # ---------------------------------------------------------------------------
@@ -251,36 +394,41 @@ async def recommend_menu(body: RecommendationRequest) -> RecommendationResponse:
     )
 
 
-@app.post("/discover", response_model=DiscoverResponse)
-async def discover(body: DiscoverRequest) -> DiscoverResponse:
+@app.post("/discover", response_model=DiscoverEnqueueResponse, status_code=202)
+async def discover(body: DiscoverRequest) -> DiscoverEnqueueResponse:
     """
-    Smart discovery endpoint:
-    location + profile/preferences -> restaurants + recommended dishes.
+    Queue a discovery request for background processing.
     """
-    restaurants = await _restaurant_service.get_nearby_restaurants(
-        body.location, body.radius
+    job_id = str(uuid4())
+    _discover_jobs[job_id] = _DiscoverJobRecord(
+        job_id=job_id,
+        request=body,
+        status=DiscoverJobStatus.queued,
+        created_at=_utc_now(),
     )
-    profile = body.profile
-    if not profile:
-        return DiscoverResponse(results=[])  # No profile = no recommendations for now
+    if _discover_queue is None:
+        raise HTTPException(status_code=503, detail="Discover worker is unavailable")
 
-    results: list[DiscoverRestaurantResult] = []
-    for restaurant in restaurants:
-        recommendations_data = await _recommendation_service.recommend_for_restaurant(
-            profile=profile,
-            restaurant=restaurant,
-            top_n=body.top_n,
-        )
+    await _discover_queue.put(job_id)
+    return DiscoverEnqueueResponse(
+        job_id=job_id,
+        status=DiscoverJobStatus.queued,
+        poll_url=f"/discover/jobs/{job_id}",
+    )
 
-        recommendations = [
-            RecommendationItemResponse(name=name, score=score, nutrition=nutrition)
-            for name, score, nutrition in recommendations_data
-        ]
-        results.append(
-            DiscoverRestaurantResult(
-                restaurant=restaurant,
-                recommendations=recommendations,
-            )
-        )
 
-    return DiscoverResponse(results=results)
+@app.get("/discover/jobs/{job_id}", response_model=DiscoverJobResponse)
+async def get_discover_job(job_id: str) -> DiscoverJobResponse:
+    job = _discover_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Discover job not found")
+
+    return DiscoverJobResponse(
+        job_id=job.job_id,
+        status=job.status,
+        created_at=job.created_at,
+        started_at=job.started_at,
+        finished_at=job.finished_at,
+        result=job.result,
+        error=job.error,
+    )

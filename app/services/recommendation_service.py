@@ -41,16 +41,24 @@ class RecommendationService:
         profile: UserProfile,
         restaurant: Restaurant,
         top_n: int,
+        items: list[MenuItem] | None = None,
     ) -> list[tuple[str, float, NutritionEstimate | None]]:
-        cached = self._recommendation_cache.get(profile.user_id, restaurant.id)
-        if cached is not None and len(cached) >= top_n:
-            return cached[:top_n]
+        # Only use recommendation cache when ranking the canonical restaurant menu.
+        use_cache = items is None
+        if use_cache:
+            cached = self._recommendation_cache.get(profile.user_id, restaurant.id)
+            if cached is not None and len(cached) >= top_n:
+                return cached[:top_n]
 
-        items = await self._menu_service.get_menu_items(restaurant)
-        nutrition_map = await self._build_nutrition_map(restaurant.id, items)
+        menu_items = (
+            items
+            if items is not None
+            else await self._menu_service.get_menu_items(restaurant)
+        )
+        nutrition_map = await self._build_nutrition_map(restaurant.id, menu_items)
         ranked = self._ranking_service.rank_top_menu(
             profile=profile,
-            items=items,
+            items=menu_items,
             n=top_n,
             nutrition_map=nutrition_map,
         )
@@ -58,20 +66,46 @@ class RecommendationService:
             (ranked_item.item.name, ranked_item.score, ranked_item.nutrition)
             for ranked_item in ranked
         ]
-        self._recommendation_cache.set(
-            profile.user_id,
-            restaurant.id,
-            recommendations,
-        )
+        if use_cache:
+            self._recommendation_cache.set(
+                profile.user_id,
+                restaurant.id,
+                recommendations,
+            )
         return recommendations
+
+    async def recommend_for_items(
+        self,
+        profile: UserProfile,
+        items: list[MenuItem],
+        top_n: int,
+    ) -> list[tuple[str, float, NutritionEstimate | None, str]]:
+        nutrition_map = await self._build_nutrition_map(None, items)
+        ranked = self._ranking_service.rank_top_menu(
+            profile=profile,
+            items=items,
+            n=top_n,
+            nutrition_map=nutrition_map,
+        )
+        return [
+            (
+                ranked_item.item.id,
+                ranked_item.score,
+                ranked_item.nutrition,
+                ranked_item.item.name,
+            )
+            for ranked_item in ranked
+        ]
 
     async def _build_nutrition_map(
         self,
-        restaurant_id: str,
+        restaurant_id: str | None,
         items: list[MenuItem],
         estimator: Estimator = Estimator.ai,
     ) -> dict[str, NutritionEstimate]:
-        cached_map = self._menu_nutrition_cache.get(restaurant_id) or {}
+        cached_map = (
+            self._menu_nutrition_cache.get(restaurant_id) or {} if restaurant_id else {}
+        )
         missing_items = [item for item in items if item.id not in cached_map]
 
         if not missing_items:
@@ -84,7 +118,8 @@ class RecommendationService:
                 estimator=estimator,
             )
 
-        self._menu_nutrition_cache.set(restaurant_id, nutrition_map)
+        if restaurant_id:
+            self._menu_nutrition_cache.set(restaurant_id, nutrition_map)
         return nutrition_map
 
     def invalidate_user_cache(self, user_id: str) -> None:
