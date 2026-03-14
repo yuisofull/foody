@@ -11,5 +11,7 @@ class RestaurantSiteProvider(MenuProvider):
     def name(self) -> str:
         return "RestaurantSite"
 
-    async def get_menu_url(self, restaurant: Restaurant) -> str | None:
-        return restaurant.website or None
+    async def get_menu_url(self, restaurant: Restaurant) -> list[str]:
+        if restaurant.website:
+            return [restaurant.website]
+        return []

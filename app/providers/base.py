@@ -14,9 +14,9 @@ class MenuProvider(ABC):
         """Human-readable name of the provider."""
 
     @abstractmethod
-    async def get_menu_url(self, restaurant: Restaurant) -> str | None:
+    async def get_menu_url(self, restaurant: Restaurant) -> list[str]:
         """
-        Attempt to resolve the menu URL for the given restaurant.
+        Attempt to resolve menu URLs for the given restaurant.
 
-        Returns the URL string if found, or None if not available.
+        Returns a list of candidate URLs (may be empty if none are found).
         """

@@ -11,16 +11,16 @@ from app.services.menu_service import MenuService
 
 
 class _FakeProvider(MenuProvider):
-    def __init__(self, name: str, url: str | None) -> None:
+    def __init__(self, name: str, urls: list[str]) -> None:
         self._name = name
-        self._url = url
+        self._urls = urls
 
     @property
     def name(self) -> str:
         return self._name
 
-    async def get_menu_url(self, restaurant: Restaurant) -> str | None:
-        return self._url
+    async def get_menu_url(self, restaurant: Restaurant) -> list[str]:
+        return self._urls
 
 
 class _FakeExtractor(MenuExtractor):
@@ -57,44 +57,54 @@ def sample_items() -> list[MenuItem]:
 
 class TestMenuService:
     @pytest.mark.asyncio
-    async def test_extract_menu_url_first_provider_wins(self, restaurant):
+    async def test_extract_menu_url_aggregates_all_providers(self, restaurant):
         providers = [
-            _FakeProvider("A", "https://a.com/menu"),
-            _FakeProvider("B", "https://b.com/menu"),
+            _FakeProvider("A", ["https://a.com/menu1", "https://a.com/menu2"]),
+            _FakeProvider("B", ["https://b.com/menu"]),
         ]
         service = MenuService()
         result = await service.extract_menu_url(restaurant, providers)
-        assert result == "https://a.com/menu"
+        assert result == ["https://a.com/menu1", "https://a.com/menu2", "https://b.com/menu"]
 
     @pytest.mark.asyncio
-    async def test_extract_menu_url_skips_none(self, restaurant):
+    async def test_extract_menu_url_deduplicates_urls(self, restaurant):
         providers = [
-            _FakeProvider("A", None),
-            _FakeProvider("B", "https://b.com/menu"),
+            _FakeProvider("A", ["https://shared.com/menu"]),
+            _FakeProvider("B", ["https://shared.com/menu", "https://b.com/menu"]),
         ]
         service = MenuService()
         result = await service.extract_menu_url(restaurant, providers)
-        assert result == "https://b.com/menu"
+        assert result == ["https://shared.com/menu", "https://b.com/menu"]
 
     @pytest.mark.asyncio
-    async def test_extract_menu_url_all_none_returns_none(self, restaurant):
+    async def test_extract_menu_url_skips_empty_provider(self, restaurant):
         providers = [
-            _FakeProvider("A", None),
-            _FakeProvider("B", None),
+            _FakeProvider("A", []),
+            _FakeProvider("B", ["https://b.com/menu"]),
         ]
         service = MenuService()
         result = await service.extract_menu_url(restaurant, providers)
-        assert result is None
+        assert result == ["https://b.com/menu"]
+
+    @pytest.mark.asyncio
+    async def test_extract_menu_url_all_empty_returns_empty_list(self, restaurant):
+        providers = [
+            _FakeProvider("A", []),
+            _FakeProvider("B", []),
+        ]
+        service = MenuService()
+        result = await service.extract_menu_url(restaurant, providers)
+        assert result == []
 
     @pytest.mark.asyncio
     async def test_extract_menu_url_empty_providers(self, restaurant):
         service = MenuService()
         result = await service.extract_menu_url(restaurant, [])
-        assert result is None
+        assert result == []
 
     @pytest.mark.asyncio
     async def test_extract_menu_returns_first_non_empty(self, restaurant, sample_items):
-        provider = _FakeProvider("P", "https://example.com")
+        provider = _FakeProvider("P", ["https://example.com"])
         extractors = [
             _FakeExtractor("Empty", []),
             _FakeExtractor("Good", sample_items),
@@ -106,7 +116,7 @@ class TestMenuService:
 
     @pytest.mark.asyncio
     async def test_extract_menu_all_empty_returns_empty(self, restaurant):
-        provider = _FakeProvider("P", "https://example.com")
+        provider = _FakeProvider("P", ["https://example.com"])
         extractors = [
             _FakeExtractor("Empty1", []),
             _FakeExtractor("Empty2", []),
@@ -117,7 +127,7 @@ class TestMenuService:
 
     @pytest.mark.asyncio
     async def test_extract_menu_no_extractors(self, restaurant):
-        provider = _FakeProvider("P", "https://example.com")
+        provider = _FakeProvider("P", ["https://example.com"])
         service = MenuService()
         result = await service.extract_menu("https://example.com/menu", provider, [])
         assert result == []

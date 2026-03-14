@@ -78,7 +78,7 @@ class MenuUrlRequest(BaseModel):
 
 
 class MenuUrlResponse(BaseModel):
-    url: str | None
+    urls: list[str]
 
 
 class ExtractMenuRequest(BaseModel):
@@ -129,10 +129,10 @@ async def get_nearby_restaurants(body: NearbyRequest) -> list[Restaurant]:
 
 @app.post("/restaurant/menu-url", response_model=MenuUrlResponse)
 async def extract_menu_url(body: MenuUrlRequest) -> MenuUrlResponse:
-    """ExtractMenuUrl(restaurant, []MenuProvider) -> url"""
+    """ExtractMenuUrl(restaurant, []MenuProvider) -> []url"""
     providers = _resolve_providers(body.providers)
-    url = await _menu_service.extract_menu_url(body.restaurant, providers)
-    return MenuUrlResponse(url=url)
+    urls = await _menu_service.extract_menu_url(body.restaurant, providers)
+    return MenuUrlResponse(urls=urls)
 
 
 @app.post("/menu/extract", response_model=list[MenuItem])

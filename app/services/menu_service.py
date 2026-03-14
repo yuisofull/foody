@@ -15,26 +15,24 @@ class MenuService:
         self,
         restaurant: Restaurant,
         providers: list[MenuProvider],
-    ) -> str | None:
+    ) -> list[str]:
         """
-        ExtractMenuUrl(restaurant, []MenuProvider) -> url
+        ExtractMenuUrl(restaurant, []MenuProvider) -> []url
 
-        Iterates through the provided MenuProviders in order and returns the
-        first URL that is successfully resolved. Returns None if no provider
-        can find a URL.
+        Queries every provided MenuProvider and aggregates the full list of
+        candidate URLs, preserving insertion order and removing duplicates.
 
         Args:
             restaurant: The target restaurant.
             providers: Ordered list of MenuProvider instances to try.
 
         Returns:
-            A menu URL string, or None.
+            A deduplicated list of menu URL strings (may be empty).
         """
+        all_urls: list[str] = []
         for provider in providers:
-            url = await provider.get_menu_url(restaurant)
-            if url:
-                return url
-        return None
+            all_urls.extend(await provider.get_menu_url(restaurant))
+        return list(dict.fromkeys(all_urls))
 
     async def extract_menu(
         self,
