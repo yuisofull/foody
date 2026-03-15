@@ -28,6 +28,9 @@ from app.services.recommendation_service import RecommendationService
 from app.services.ranking_service import RankingService
 from app.services.restaurant_service import RestaurantService
 from app.services.user_service import UserService
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 app = FastAPI(
     title="Foody API",

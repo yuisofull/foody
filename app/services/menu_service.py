@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 
 from cachetools import TTLCache
 
@@ -71,6 +72,7 @@ class MenuService:
         provider = self._providers[0] if self._providers else RestaurantSiteProvider()
         for extractor in self._extractors:
             items = await extractor.extract(menu_url, provider)
+            logging.info(f"Extractor {extractor.name} returned {len(items)} items for URL: {menu_url}")
             if items:
                 self._menu_cache.set(menu_url, items)
                 return items
@@ -93,13 +95,16 @@ class MenuService:
         """
         cached_menu = self._restaurant_menu_cache.get(restaurant.id)
         if cached_menu is not None:
+            logging.info(f"Restaurant menu cache hit for {restaurant.name} (ID: {restaurant.id})")
             return cached_menu
 
         urls = await self._extract_menu_url(restaurant)
+        logging.info(f"Extracted menu URLs for {restaurant.name} (ID: {restaurant.id}): {urls}")
         for url in urls:
             items = await self.extract_menu(url)
             if items:
                 self._restaurant_menu_cache[restaurant.id] = items
+                logging.info(f"Found menu items for {restaurant.name} (ID: {restaurant.id}): {len(items)}")
                 return items
 
         self._restaurant_menu_cache[restaurant.id] = []
